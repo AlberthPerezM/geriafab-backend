@@ -18,6 +18,22 @@ PROMPT_DIR = os.getenv("PROMPT_DIR", os.path.join(BASE_DIR, "prompts"))
 PROMPT_FILE = os.getenv("PROMPT_FILE", "default.txt")
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "40"))
 HISTORY_TTL_SECONDS = int(os.getenv("HISTORY_TTL_SECONDS", "1800"))
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        ",".join(
+            [
+                "http://localhost:4200",
+                "http://127.0.0.1:4200",
+                "http://localhost:8080",
+                "http://127.0.0.1:8080",
+                "https://geriafab-frontend.vercel.app",
+            ]
+        ),
+    ).split(",")
+    if origin.strip()
+]
 GEMINI_TIMEOUT = httpx.Timeout(
     connect=float(os.getenv("GEMINI_CONNECT_TIMEOUT", "10")),
     read=float(os.getenv("GEMINI_READ_TIMEOUT", "30")),
@@ -154,12 +170,7 @@ async def post_to_gemini(url: str, payload: dict, headers: dict) -> httpx.Respon
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:4200",
-        "http://127.0.0.1:4200",
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-    ],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
