@@ -61,17 +61,17 @@ def build_system_instruction(instr: str) -> str:
     )
     return "\n\n".join(parts)
 
-def build_contents_with_instruction(instr: str, user_text: str, history: Optional[list[dict]] = None) -> list[dict]:
-    system_text = build_system_instruction(instr)
-    instruction_text = (
-        f"{system_text}\n\nMensaje del usuario:\n{user_text}"
-        if system_text
-        else user_text
-    )
+def build_contents(user_text: str, history: Optional[list[dict]] = None) -> list[dict]:
     return [
         *(history or []),
-        {"role": "user", "parts": [{"text": instruction_text}]},
+        {"role": "user", "parts": [{"text": user_text}]},
     ]
+
+def build_generation_config() -> dict:
+    return {
+        "temperature": float(os.getenv("GEMINI_TEMPERATURE", "0.5")),
+        "maxOutputTokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512")),
+    }
 
 def prune_history() -> None:
     cutoff = time.time() - HISTORY_TTL_SECONDS
@@ -189,8 +189,13 @@ def extract_text(obj):
                         # content may be dict with 'parts' or a list
                         if isinstance(content, dict) and "parts" in content and isinstance(content["parts"], list) and len(content["parts"])>0:
                             p0 = content["parts"][0]
-                            if isinstance(p0, dict) and "text" in p0:
-                                return str(p0["text"])
+                            texts = [
+                                str(part["text"])
+                                for part in content["parts"]
+                                if isinstance(part, dict) and "text" in part
+                            ]
+                            if texts:
+                                return "".join(texts)
                         if isinstance(content, list) and len(content) > 0:
                             c0 = content[0]
                             if isinstance(c0, dict) and "text" in c0:
@@ -221,11 +226,9 @@ async def test():
         return PlainTextResponse("GEMINI_API_URL not configured. Set GEMINI_API_URL in .env.", status_code=400)
 
     payload = {
-        "contents": build_contents_with_instruction(instr, "Hola Gemini"),
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "120")),
-        },
+        "systemInstruction": {"parts": [{"text": build_system_instruction(instr)}]},
+        "contents": build_contents("Hola Gemini"),
+        "generationConfig": build_generation_config(),
     }
 
     headers = {
@@ -254,11 +257,9 @@ async def gemini(p: Prompt):
 
     user_text = p.prompt.strip()
     payload = {
-        "contents": build_contents_with_instruction(instr, user_text, get_recent_history()),
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "120")),
-        },
+        "systemInstruction": {"parts": [{"text": build_system_instruction(instr)}]},
+        "contents": build_contents(user_text, get_recent_history()),
+        "generationConfig": build_generation_config(),
     }
 
     headers = {"Content-Type": "application/json", "X-goog-api-key": key}
