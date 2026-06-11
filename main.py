@@ -61,6 +61,18 @@ def build_system_instruction(instr: str) -> str:
     )
     return "\n\n".join(parts)
 
+def build_contents_with_instruction(instr: str, user_text: str, history: Optional[list[dict]] = None) -> list[dict]:
+    system_text = build_system_instruction(instr)
+    instruction_text = (
+        f"{system_text}\n\nMensaje del usuario:\n{user_text}"
+        if system_text
+        else user_text
+    )
+    return [
+        *(history or []),
+        {"role": "user", "parts": [{"text": instruction_text}]},
+    ]
+
 def prune_history() -> None:
     cutoff = time.time() - HISTORY_TTL_SECONDS
     conversation_history[:] = [
@@ -209,8 +221,7 @@ async def test():
         return PlainTextResponse("GEMINI_API_URL not configured. Set GEMINI_API_URL in .env.", status_code=400)
 
     payload = {
-        "system_instruction": {"parts": [{"text": build_system_instruction(instr)}]},
-        "contents": [{"role": "user", "parts": [{"text": "Hola Gemini"}]}],
+        "contents": build_contents_with_instruction(instr, "Hola Gemini"),
         "generationConfig": {
             "temperature": 0.4,
             "maxOutputTokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "120")),
@@ -242,13 +253,8 @@ async def gemini(p: Prompt):
         return PlainTextResponse("GEMINI_API_URL not configured. Set GEMINI_API_URL in .env.", status_code=400)
 
     user_text = p.prompt.strip()
-    contents = [
-        *get_recent_history(),
-        {"role": "user", "parts": [{"text": user_text}]},
-    ]
     payload = {
-        "system_instruction": {"parts": [{"text": build_system_instruction(instr)}]},
-        "contents": contents,
+        "contents": build_contents_with_instruction(instr, user_text, get_recent_history()),
         "generationConfig": {
             "temperature": 0.4,
             "maxOutputTokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "120")),
