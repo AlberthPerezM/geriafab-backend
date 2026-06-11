@@ -226,7 +226,7 @@ async def test():
         return PlainTextResponse("GEMINI_API_URL not configured. Set GEMINI_API_URL in .env.", status_code=400)
 
     payload = {
-        "systemInstruction": {"parts": [{"text": build_system_instruction(instr)}]},
+        "system_instruction": {"parts": [{"text": build_system_instruction(instr)}]},
         "contents": build_contents("Hola Gemini"),
         "generationConfig": build_generation_config(),
     }
@@ -257,7 +257,7 @@ async def gemini(p: Prompt):
 
     user_text = p.prompt.strip()
     payload = {
-        "systemInstruction": {"parts": [{"text": build_system_instruction(instr)}]},
+        "system_instruction": {"parts": [{"text": build_system_instruction(instr)}]},
         "contents": build_contents(user_text, get_recent_history()),
         "generationConfig": build_generation_config(),
     }
