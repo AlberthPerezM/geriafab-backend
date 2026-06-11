@@ -7,12 +7,26 @@ from typing import Optional
 from fastapi.responses import PlainTextResponse
 from datetime import datetime
 import zoneinfo
+import httpx
+import re
+import time
 load_dotenv()
 
 # Prompt files directory (default: ./prompts)
 BASE_DIR = os.path.dirname(__file__)
 PROMPT_DIR = os.getenv("PROMPT_DIR", os.path.join(BASE_DIR, "prompts"))
 PROMPT_FILE = os.getenv("PROMPT_FILE", "default.txt")
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "40"))
+HISTORY_TTL_SECONDS = int(os.getenv("HISTORY_TTL_SECONDS", "1800"))
+GEMINI_TIMEOUT = httpx.Timeout(
+    connect=float(os.getenv("GEMINI_CONNECT_TIMEOUT", "10")),
+    read=float(os.getenv("GEMINI_READ_TIMEOUT", "30")),
+    write=float(os.getenv("GEMINI_WRITE_TIMEOUT", "30")),
+    pool=float(os.getenv("GEMINI_POOL_TIMEOUT", "30")),
+)
+
+conversation_history: list[dict] = []
+gemini_client: httpx.AsyncClient | None = None
 
 def read_prompt_file(name: Optional[str] = None) -> str:
     name = name or PROMPT_FILE
@@ -36,6 +50,58 @@ def get_datetime_str() -> str:
     except Exception:
         return "Fecha y hora desconocida"
 
+def build_system_instruction(instr: str) -> str:
+    include_dt = os.getenv("PROMPT_INCLUDE_DATETIME", "1") != "0"
+    parts = [instr.strip()] if instr else []
+    if include_dt:
+        parts.append(get_datetime_str())
+    parts.append(
+        "No saludes de nuevo si la conversacion ya empezo. "
+        "Responde directo a lo ultimo que dijo el usuario."
+    )
+    return "\n\n".join(parts)
+
+def prune_history() -> None:
+    cutoff = time.time() - HISTORY_TTL_SECONDS
+    conversation_history[:] = [
+        item for item in conversation_history
+        if item["created_at"] >= cutoff
+    ]
+    if len(conversation_history) > MAX_HISTORY_MESSAGES:
+        del conversation_history[:-MAX_HISTORY_MESSAGES]
+
+def get_recent_history() -> list[dict]:
+    prune_history()
+    return [item["message"] for item in conversation_history]
+
+def append_history(role: str, text: str) -> None:
+    if not text:
+        return
+
+    conversation_history.append({
+        "created_at": time.time(),
+        "message": {"role": role, "parts": [{"text": text}]},
+    })
+    prune_history()
+
+def strip_repeated_greeting(text: str) -> str:
+    if not get_recent_history():
+        return text
+
+    cleaned = re.sub(
+        r"^\s*(hola|buenos dias|buenas tardes|buenas noches)[,!.\s]*(soy geriabot[,!.\s]*)?",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    ).lstrip()
+
+    if not cleaned:
+        return "Te escucho."
+    if cleaned != text:
+        return cleaned[:1].upper() + cleaned[1:]
+    return text
+
 def write_prompt_file(name: str, text: str) -> bool:
     try:
         os.makedirs(PROMPT_DIR, exist_ok=True)
@@ -47,6 +113,23 @@ def write_prompt_file(name: str, text: str) -> bool:
         return False
 
 app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global gemini_client
+    gemini_client = httpx.AsyncClient(timeout=GEMINI_TIMEOUT)
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    if gemini_client is not None:
+        await gemini_client.aclose()
+
+async def post_to_gemini(url: str, payload: dict, headers: dict) -> httpx.Response:
+    if gemini_client is None:
+        async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+            return await client.post(url, json=payload, headers=headers)
+
+    return await gemini_client.post(url, json=payload, headers=headers)
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,21 +208,21 @@ async def test():
     if not url:
         return PlainTextResponse("GEMINI_API_URL not configured. Set GEMINI_API_URL in .env.", status_code=400)
 
-    include_dt = os.getenv("PROMPT_INCLUDE_DATETIME", "1") != "0"
-    prefix = instr + "\n\n" if instr else ""
-    if include_dt:
-        prefix += get_datetime_str() + "\n\n"
-    prompt_text = prefix + "Hola Gemini"
-    payload = {"contents": [{"parts": [{"text": prompt_text}] }]}
+    payload = {
+        "system_instruction": {"parts": [{"text": build_system_instruction(instr)}]},
+        "contents": [{"role": "user", "parts": [{"text": "Hola Gemini"}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "120")),
+        },
+    }
 
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": key
     }
 
-    import httpx
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, json=payload, headers=headers)
+    response = await post_to_gemini(url, payload, headers)
 
     try:
         j = response.json()
@@ -158,25 +241,37 @@ async def gemini(p: Prompt):
     if not url:
         return PlainTextResponse("GEMINI_API_URL not configured. Set GEMINI_API_URL in .env.", status_code=400)
 
-    include_dt = os.getenv("PROMPT_INCLUDE_DATETIME", "1") != "0"
-    prefix = instr + "\n\n" if instr else ""
-    if include_dt:
-        prefix += get_datetime_str() + "\n\n"
-    prompt_text = prefix + p.prompt
-    payload = {"contents": [{"parts": [{"text": prompt_text}] }]}
+    user_text = p.prompt.strip()
+    contents = [
+        *get_recent_history(),
+        {"role": "user", "parts": [{"text": user_text}]},
+    ]
+    payload = {
+        "system_instruction": {"parts": [{"text": build_system_instruction(instr)}]},
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "120")),
+        },
+    }
 
     headers = {"Content-Type": "application/json", "X-goog-api-key": key}
 
-    import httpx
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, json=payload, headers=headers)
+    try:
+        response = await post_to_gemini(url, payload, headers)
+    except httpx.ReadTimeout:
+        return PlainTextResponse("Gemini tardo demasiado en responder", status_code=504)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=500)
 
     try:
         j = response.json()
     except Exception:
         return PlainTextResponse(response.text or f"status: {response.status_code}", status_code=response.status_code)
 
-    text = extract_text(j)
+    text = strip_repeated_greeting(extract_text(j))
+    append_history("user", user_text)
+    append_history("model", text)
     return PlainTextResponse(text)
 
 
