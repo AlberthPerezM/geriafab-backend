@@ -53,8 +53,8 @@ def build_system_instruction(instr: str) -> str:
     if settings.prompt_include_datetime:
         parts.append(get_datetime_str())
     parts.append(
-        "No saludes de nuevo si la conversacion ya empezo. "
-        "Responde directo a lo ultimo que dijo el usuario."
+        "Si la conversacion ya empezo, evita presentarte de nuevo salvo que el usuario salude o lo pida. "
+        "Responde directo a lo ultimo que dijo el usuario y conserva un tono conversacional."
     )
     return "\n\n".join(parts)
 
@@ -66,12 +66,21 @@ def build_contents(user_text: str, history: Optional[list[dict]] = None) -> list
 
 def build_contents_with_instruction(instr: str, user_text: str, history: Optional[list[dict]] = None) -> list[dict]:
     system_text = build_system_instruction(instr)
-    instruction_text = (
-        f"{system_text}\n\nMensaje del usuario:\n{user_text}"
-        if system_text
-        else user_text
-    )
-    return build_contents(instruction_text, history)
+    if not system_text:
+        return build_contents(user_text, history)
+
+    return [
+        {"role": "user", "parts": [{"text": system_text}]},
+        {"role": "model", "parts": [{"text": "Entendido."}]},
+        *(history or []),
+        {"role": "user", "parts": [{"text": user_text}]},
+    ]
+
+def build_gemini_payload(instr: str, user_text: str, history: Optional[list[dict]] = None) -> dict:
+    return {
+        "contents": build_contents_with_instruction(instr, user_text, history),
+        "generationConfig": build_generation_config(),
+    }
 
 def build_personalized_user_text(user_text: str, profile: Optional["SeniorProfile"]) -> str:
     if profile is None:
@@ -164,11 +173,12 @@ def build_generation_config() -> dict:
     return config
 
 def prune_history() -> None:
-    cutoff = time.time() - settings.history_ttl_seconds
-    conversation_history[:] = [
-        item for item in conversation_history
-        if item["created_at"] >= cutoff
-    ]
+    if settings.history_ttl_seconds > 0:
+        cutoff = time.time() - settings.history_ttl_seconds
+        conversation_history[:] = [
+            item for item in conversation_history
+            if item["created_at"] >= cutoff
+        ]
     if len(conversation_history) > settings.max_history_messages:
         del conversation_history[:-settings.max_history_messages]
 
@@ -193,6 +203,13 @@ def append_history(role: str, text: str) -> None:
         "message": {"role": role, "parts": [{"text": text}]},
     })
     prune_history()
+
+def append_turn_history(user_text: str, model_text: str) -> None:
+    if database_available and append_turn_history_to_db(user_text, model_text):
+        return
+
+    append_history("user", user_text)
+    append_history("model", model_text)
 
 def get_db_connection():
     if not settings.database_url:
@@ -386,17 +403,29 @@ def get_recent_history_from_db() -> Optional[list[dict]]:
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT rol, contenido
-                    FROM mensajes_conversacion
-                    WHERE sesion_id = %s
-                      AND creado_en >= NOW() - (%s * INTERVAL '1 second')
-                    ORDER BY creado_en DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (settings.conversation_session_id, cutoff_seconds, settings.max_history_messages),
-                )
+                if cutoff_seconds > 0:
+                    cur.execute(
+                        """
+                        SELECT rol, contenido
+                        FROM mensajes_conversacion
+                        WHERE sesion_id = %s
+                          AND creado_en >= NOW() - (%s * INTERVAL '1 second')
+                        ORDER BY creado_en DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (settings.conversation_session_id, cutoff_seconds, settings.max_history_messages),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT rol, contenido
+                        FROM mensajes_conversacion
+                        WHERE sesion_id = %s
+                        ORDER BY creado_en DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (settings.conversation_session_id, settings.max_history_messages),
+                    )
                 rows = cur.fetchall()
         rows.reverse()
         return [
@@ -430,22 +459,31 @@ def append_history_to_db(role: str, text: str) -> bool:
         logger.exception("PostgreSQL history write failed")
         return False
 
-def strip_repeated_greeting(text: str) -> str:
-    if not get_recent_history():
-        return text
+def append_turn_history_to_db(user_text: str, model_text: str) -> bool:
+    global database_available, last_database_error
 
-    cleaned = re.sub(
-        r"^\s*(hola|buenos dias|buenas tardes|buenas noches)[,!.\s]*(soy geriabot[,!.\s]*)?",
-        "",
-        text,
-        count=1,
-        flags=re.IGNORECASE,
-    ).lstrip()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO mensajes_conversacion (sesion_id, rol, contenido)
+                    VALUES (%s, %s, %s)
+                    """,
+                    [
+                        (settings.conversation_session_id, "user", user_text),
+                        (settings.conversation_session_id, "model", model_text),
+                    ],
+                )
+            conn.commit()
+        return True
+    except Exception as exc:
+        database_available = False
+        last_database_error = str(exc)
+        logger.exception("PostgreSQL turn history write failed")
+        return False
 
-    if not cleaned:
-        return "Te escucho."
-    if cleaned != text:
-        return cleaned[:1].upper() + cleaned[1:]
+def strip_repeated_greeting(text: str, history: Optional[list[dict]] = None) -> str:
     return text
 
 def normalize_voice_text(text: str) -> str:
@@ -453,6 +491,9 @@ def normalize_voice_text(text: str) -> str:
     text = re.sub(r"([!?.,])\1{2,}", r"\1", text)
     text = re.sub(r"\b(\w+)(\s+\1\b){2,}", r"\1", text, flags=re.IGNORECASE)
     return text.strip()
+
+def is_simple_greeting(text: str) -> bool:
+    return bool(re.match(r"^\s*(hola|buenos dias|buenas tardes|buenas noches|buen dia)\s*[!.?]*\s*$", text, flags=re.IGNORECASE))
 
 def is_voice_noise(text: str) -> bool:
     if not text:
@@ -1137,10 +1178,7 @@ async def test():
     if not key:
         return make_error_response("GEMINI_API_KEY no esta configurado en .env", 400)
 
-    payload = {
-        "contents": build_contents_with_instruction(instr, "Hola Gemini"),
-        "generationConfig": build_generation_config(),
-    }
+    payload = build_gemini_payload(instr, "Hola Gemini")
 
     headers = {
         "Content-Type": "application/json",
@@ -1195,11 +1233,8 @@ async def gemini(p: Prompt, authorization: Optional[str] = Header(None)):
         profile = load_profile_for_user(user["id"])
 
     personalized_user_text = build_personalized_user_text(user_text, profile)
-    recent_history = get_recent_history()
-    payload = {
-        "contents": build_contents_with_instruction(instr, personalized_user_text, recent_history),
-        "generationConfig": build_generation_config(),
-    }
+    recent_history = [] if is_simple_greeting(user_text) else get_recent_history()
+    payload = build_gemini_payload(instr, personalized_user_text, recent_history)
 
     headers = {"Content-Type": "application/json", "X-goog-api-key": key}
 
@@ -1225,12 +1260,11 @@ async def gemini(p: Prompt, authorization: Optional[str] = Header(None)):
     if response.is_error:
         return make_error_response(gemini_error_message(response, j), response.status_code)
 
-    text = strip_repeated_greeting(extract_text(j))
+    text = strip_repeated_greeting(extract_text(j), recent_history)
     if not text:
         return make_error_response("Gemini no devolvio texto util", 502)
 
-    append_history("user", user_text)
-    append_history("model", text)
+    append_turn_history(user_text, text)
     return PlainTextResponse(text)
 
 

@@ -18,6 +18,7 @@ DEFAULT_CORS_ALLOWED_ORIGINS = (
 )
 DEFAULT_VOICE_NOISE_PATTERNS = (
     r"^\s*(eh+|em+|mmm+|um+|uh+|este)\s*$",
+    r"^\s*string\s*$",
     r"^\s*(no se escucho|no se escucha|audio vacio|sin audio)\s*$",
     r"^\s*(subtitulos por la comunidad|gracias por ver|thank you for watching)\s*$",
 )
@@ -49,8 +50,8 @@ class Settings:
     prompt_instructions: str = field(default_factory=lambda: os.getenv("PROMPT_INSTRUCTIONS", ""))
     prompt_include_datetime: bool = field(default_factory=lambda: _get_bool("PROMPT_INCLUDE_DATETIME", True))
 
-    max_history_messages: int = field(default_factory=lambda: int(os.getenv("MAX_HISTORY_MESSAGES", "40")))
-    history_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("HISTORY_TTL_SECONDS", "1800")))
+    max_history_messages: int = field(default_factory=lambda: int(os.getenv("MAX_HISTORY_MESSAGES", "12")))
+    history_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("HISTORY_TTL_SECONDS", "0")))
     conversation_session_id: str = field(default_factory=lambda: os.getenv("CONVERSATION_SESSION_ID", "default"))
 
     database_url: str | None = field(default_factory=lambda: os.getenv("DATABASE_URL"))
