@@ -941,10 +941,11 @@ def get_user_by_token(token: Optional[str]) -> Optional[dict]:
                     cur.execute(
                         """
                         UPDATE sesiones_usuario
-                        SET ultimo_uso_en = NOW()
+                        SET ultimo_uso_en = NOW(),
+                            expira_en = NOW() + (%s * INTERVAL '1 second')
                         WHERE token = %s
                         """,
-                        (token_hash,),
+                        (settings.session_ttl_seconds, token_hash),
                     )
             conn.commit()
     except Exception as exc:

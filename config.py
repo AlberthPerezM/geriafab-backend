@@ -75,7 +75,7 @@ class Settings:
 
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
     password_hash_iterations: int = field(default_factory=lambda: int(os.getenv("PASSWORD_HASH_ITERATIONS", "310000")))
-    session_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60 * 24 * 7))))
+    session_ttl_seconds: int = field(default_factory=lambda: int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60 * 24 * 3650))))
     voice_noise_patterns: tuple[str, ...] = DEFAULT_VOICE_NOISE_PATTERNS
 
 
