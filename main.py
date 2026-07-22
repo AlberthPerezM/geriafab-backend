@@ -16,6 +16,8 @@ import psycopg
 import hashlib
 import hmac
 import secrets
+import ssl
+import truststore
 
 try:
     from psycopg_pool import ConnectionPool
@@ -33,6 +35,7 @@ database_available = bool(settings.database_url)
 last_database_error: str | None = None
 logger = logging.getLogger("geriafab")
 logging.basicConfig(level=settings.log_level)
+system_ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
 def read_prompt_file(name: Optional[str] = None) -> str:
     name = name or settings.prompt_file
@@ -713,7 +716,7 @@ async def startup_event() -> None:
     global gemini_client
     init_db_pool()
     init_database()
-    gemini_client = httpx.AsyncClient(timeout=settings.gemini_timeout)
+    gemini_client = httpx.AsyncClient(timeout=settings.gemini_timeout, verify=system_ssl_context)
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
@@ -723,7 +726,7 @@ async def shutdown_event() -> None:
 
 async def post_to_gemini(url: str, payload: dict, headers: dict) -> httpx.Response:
     if gemini_client is None:
-        async with httpx.AsyncClient(timeout=settings.gemini_timeout) as client:
+        async with httpx.AsyncClient(timeout=settings.gemini_timeout, verify=system_ssl_context) as client:
             return await client.post(url, json=payload, headers=headers)
 
     return await gemini_client.post(url, json=payload, headers=headers)
@@ -731,7 +734,7 @@ async def post_to_gemini(url: str, payload: dict, headers: dict) -> httpx.Respon
 async def get_from_youtube(params: dict) -> httpx.Response:
     url = "https://www.googleapis.com/youtube/v3/search"
     if gemini_client is None:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, verify=system_ssl_context) as client:
             return await client.get(url, params=params)
 
     return await gemini_client.get(url, params=params, timeout=20)
