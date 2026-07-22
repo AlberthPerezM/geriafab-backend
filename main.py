@@ -728,6 +728,14 @@ async def post_to_gemini(url: str, payload: dict, headers: dict) -> httpx.Respon
 
     return await gemini_client.post(url, json=payload, headers=headers)
 
+async def get_from_youtube(params: dict) -> httpx.Response:
+    url = "https://www.googleapis.com/youtube/v3/search"
+    if gemini_client is None:
+        async with httpx.AsyncClient(timeout=20) as client:
+            return await client.get(url, params=params)
+
+    return await gemini_client.get(url, params=params, timeout=20)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origins,
@@ -1355,8 +1363,52 @@ async def health():
         "database_error": last_database_error,
         "gemini_url_configured": bool(settings.gemini_api_url),
         "gemini_key_configured": bool(settings.gemini_api_key),
+        "youtube_key_configured": bool(settings.youtube_api_key),
         "max_output_tokens_limited": settings.gemini_max_output_tokens is not None,
     }
+
+@app.get("/api/youtube/search")
+async def search_youtube(q: str):
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Escribe una busqueda")
+    if len(query) > 200:
+        raise HTTPException(status_code=400, detail="La busqueda es demasiado larga")
+    if not settings.youtube_api_key:
+        raise HTTPException(status_code=503, detail="YOUTUBE_API_KEY no esta configurado en el backend")
+
+    try:
+        response = await get_from_youtube({
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "key": settings.youtube_api_key,
+            "maxResults": 8,
+            "relevanceLanguage": "es",
+        })
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        logger.warning("YouTube API respondio con estado %s", exc.response.status_code)
+        raise HTTPException(status_code=502, detail="YouTube no pudo completar la busqueda") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.exception("Error al conectar con YouTube")
+        raise HTTPException(status_code=502, detail="No se pudo conectar con YouTube") from exc
+
+    results = []
+    for item in payload.get("items", []):
+        video_id = item.get("id", {}).get("videoId")
+        snippet = item.get("snippet", {})
+        thumbnails = snippet.get("thumbnails", {})
+        if video_id:
+            results.append({
+                "videoId": video_id,
+                "title": snippet.get("title", ""),
+                "channel": snippet.get("channelTitle", ""),
+                "thumbnail": thumbnails.get("medium", {}).get("url") or thumbnails.get("default", {}).get("url", ""),
+            })
+
+    return results
 
 @app.post("/api/auth/register")
 async def register(payload: AuthRegister):
