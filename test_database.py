@@ -5,7 +5,18 @@ from dotenv import load_dotenv
 import psycopg
 
 
-EXPECTED_TABLES = {"archivos_prompt", "mensajes_conversacion"}
+EXPECTED_TABLES = {
+    "usuarios",
+    "sesiones_usuario",
+    "mensajes_conversacion",
+    "adultos_mayores",
+    "ficha_datos",
+    "ficha_salud",
+    "ficha_preferencias",
+    "ficha_notas",
+    "medicamentos_adulto_mayor",
+    "contactos_emergencia",
+}
 
 
 def main() -> int:
@@ -46,7 +57,7 @@ def main() -> int:
         missing_tables = EXPECTED_TABLES - found_tables
         if missing_tables:
             print(f"ERROR: faltan tablas: {', '.join(sorted(missing_tables))}")
-            print("Ejecuta: psql -U geriafab_usuario -d geriafab_bd -f database/schema.sql")
+            print("Inicia el backend (main.py) una vez: init_database() crea el esquema automaticamente.")
             return 1
 
         return 0

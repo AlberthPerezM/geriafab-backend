@@ -17,10 +17,18 @@ import hashlib
 import hmac
 import secrets
 
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:  # pragma: no cover - el pool es opcional
+    ConnectionPool = None  # type: ignore[assignment,misc]
+
 from config import settings
 
-conversation_history: list[dict] = []
+# Historial en memoria (fallback si la base de datos no esta disponible), llaveado
+# por perfil. La clave None corresponde al modo anonimo/demo sin perfil.
+conversation_history: dict[Optional[int], list[dict]] = {}
 gemini_client: httpx.AsyncClient | None = None
+db_pool: "ConnectionPool | None" = None
 database_available = bool(settings.database_url)
 last_database_error: str | None = None
 logger = logging.getLogger("geriafab")
@@ -172,46 +180,72 @@ def build_generation_config() -> dict:
         config["maxOutputTokens"] = settings.gemini_max_output_tokens
     return config
 
-def prune_history() -> None:
+def prune_history(adulto_mayor_id: Optional[int]) -> None:
+    items = conversation_history.get(adulto_mayor_id)
+    if not items:
+        return
     if settings.history_ttl_seconds > 0:
         cutoff = time.time() - settings.history_ttl_seconds
-        conversation_history[:] = [
-            item for item in conversation_history
-            if item["created_at"] >= cutoff
-        ]
-    if len(conversation_history) > settings.max_history_messages:
-        del conversation_history[:-settings.max_history_messages]
+        items[:] = [item for item in items if item["created_at"] >= cutoff]
+    if len(items) > settings.max_history_messages:
+        del items[:-settings.max_history_messages]
 
-def get_recent_history() -> list[dict]:
-    if database_available:
-        db_history = get_recent_history_from_db()
+def get_recent_history(adulto_mayor_id: Optional[int]) -> list[dict]:
+    if database_available and adulto_mayor_id is not None:
+        db_history = get_recent_history_from_db(adulto_mayor_id)
         if db_history is not None:
             return db_history
 
-    prune_history()
-    return [item["message"] for item in conversation_history]
+    prune_history(adulto_mayor_id)
+    return [item["message"] for item in conversation_history.get(adulto_mayor_id, [])]
 
-def append_history(role: str, text: str) -> None:
+def append_history(adulto_mayor_id: Optional[int], role: str, text: str) -> None:
     if not text:
         return
 
-    if database_available and append_history_to_db(role, text):
+    if database_available and adulto_mayor_id is not None and append_history_to_db(adulto_mayor_id, role, text):
         return
 
-    conversation_history.append({
+    conversation_history.setdefault(adulto_mayor_id, []).append({
         "created_at": time.time(),
         "message": {"role": role, "parts": [{"text": text}]},
     })
-    prune_history()
+    prune_history(adulto_mayor_id)
 
-def append_turn_history(user_text: str, model_text: str) -> None:
-    if database_available and append_turn_history_to_db(user_text, model_text):
+def append_turn_history(adulto_mayor_id: Optional[int], user_text: str, model_text: str) -> None:
+    if database_available and adulto_mayor_id is not None and append_turn_history_to_db(adulto_mayor_id, user_text, model_text):
         return
 
-    append_history("user", user_text)
-    append_history("model", model_text)
+    append_history(adulto_mayor_id, "user", user_text)
+    append_history(adulto_mayor_id, "model", model_text)
+
+def init_db_pool() -> None:
+    """Abre un pool de conexiones reutilizables (si psycopg_pool esta disponible)."""
+    global db_pool
+    if db_pool is not None or not settings.database_url or ConnectionPool is None:
+        return
+    try:
+        db_pool = ConnectionPool(
+            settings.database_url,
+            min_size=1,
+            max_size=int(os.getenv("DB_POOL_MAX_SIZE", "10")),
+            timeout=float(os.getenv("DB_POOL_TIMEOUT", "10")),
+            open=True,
+        )
+    except Exception:
+        db_pool = None
+        logger.exception("No se pudo abrir el pool de conexiones; se usara conexion directa")
+
+def close_db_pool() -> None:
+    global db_pool
+    if db_pool is not None:
+        db_pool.close()
+        db_pool = None
 
 def get_db_connection():
+    if db_pool is not None:
+        # Context manager que presta una conexion del pool y la devuelve al salir.
+        return db_pool.connection()
     if not settings.database_url:
         return None
     return psycopg.connect(settings.database_url)
@@ -317,11 +351,38 @@ def init_database() -> None:
                         ON sesiones_usuario (token)
                     """
                 )
+                # Perfil raiz: un adulto mayor por fila, varios por usuario/apoderado.
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS adultos_mayores (
                         id BIGSERIAL PRIMARY KEY,
-                        usuario_id BIGINT NOT NULL UNIQUE REFERENCES usuarios(id) ON DELETE CASCADE,
+                        usuario_id BIGINT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+                        nombre VARCHAR(180) NOT NULL DEFAULT '',
+                        creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                # En instalaciones previas usuario_id era UNIQUE (un solo perfil por
+                # cuenta). Se elimina para permitir varios adultos mayores por apoderado.
+                cur.execute(
+                    """
+                    ALTER TABLE adultos_mayores
+                    DROP CONSTRAINT IF EXISTS adultos_mayores_usuario_id_key
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_adultos_mayores_usuario
+                        ON adultos_mayores (usuario_id)
+                    """
+                )
+                # Una tabla por apartado del formulario (relacion 1:1 con el perfil).
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ficha_datos (
+                        id BIGSERIAL PRIMARY KEY,
+                        adulto_mayor_id BIGINT NOT NULL UNIQUE REFERENCES adultos_mayores(id) ON DELETE CASCADE,
                         nombre VARCHAR(180) NOT NULL DEFAULT '',
                         sobrenombre VARCHAR(180) NOT NULL DEFAULT '',
                         nivel_movilidad VARCHAR(120) NOT NULL DEFAULT '',
@@ -329,12 +390,28 @@ def init_database() -> None:
                         estado_animo_general VARCHAR(180) NOT NULL DEFAULT '',
                         habitacion_principal VARCHAR(180) NOT NULL DEFAULT '',
                         particularidad TEXT NOT NULL DEFAULT '',
-                        detalles_movilidad TEXT NOT NULL DEFAULT '',
+                        detalles_movilidad TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ficha_salud (
+                        id BIGSERIAL PRIMARY KEY,
+                        adulto_mayor_id BIGINT NOT NULL UNIQUE REFERENCES adultos_mayores(id) ON DELETE CASCADE,
                         tiene_enfermedad_preexistente BOOLEAN NOT NULL DEFAULT FALSE,
                         enfermedad_preexistente TEXT NOT NULL DEFAULT '',
                         requiere_medicacion BOOLEAN NOT NULL DEFAULT FALSE,
                         hora_levantarse TIME,
-                        hora_acostarse TIME,
+                        hora_acostarse TIME
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ficha_preferencias (
+                        id BIGSERIAL PRIMARY KEY,
+                        adulto_mayor_id BIGINT NOT NULL UNIQUE REFERENCES adultos_mayores(id) ON DELETE CASCADE,
                         color_agrado VARCHAR(120) NOT NULL DEFAULT '',
                         tema_gusto VARCHAR(180) NOT NULL DEFAULT '',
                         actividades_diarias TEXT NOT NULL DEFAULT '',
@@ -342,11 +419,17 @@ def init_database() -> None:
                         detonantes_felicidad TEXT NOT NULL DEFAULT '',
                         detonantes_relajacion TEXT NOT NULL DEFAULT '',
                         detonantes_tristeza TEXT NOT NULL DEFAULT '',
-                        detonantes_molestia TEXT NOT NULL DEFAULT '',
+                        detonantes_molestia TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ficha_notas (
+                        id BIGSERIAL PRIMARY KEY,
+                        adulto_mayor_id BIGINT NOT NULL UNIQUE REFERENCES adultos_mayores(id) ON DELETE CASCADE,
                         notas_cuidador TEXT NOT NULL DEFAULT '',
-                        notas_adulto_mayor TEXT NOT NULL DEFAULT '',
-                        creado_en TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        notas_adulto_mayor TEXT NOT NULL DEFAULT ''
                     )
                     """
                 )
@@ -388,6 +471,82 @@ def init_database() -> None:
                         ON contactos_emergencia (adulto_mayor_id, orden, id)
                     """
                 )
+                # Historial por perfil: cada mensaje pertenece a un adulto mayor.
+                cur.execute(
+                    """
+                    ALTER TABLE mensajes_conversacion
+                    ADD COLUMN IF NOT EXISTS adulto_mayor_id BIGINT
+                        REFERENCES adultos_mayores(id) ON DELETE CASCADE
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_mensajes_conversacion_adulto
+                        ON mensajes_conversacion (adulto_mayor_id, creado_en)
+                    """
+                )
+                # Migracion idempotente: si el esquema previo guardaba los apartados en
+                # columnas de adultos_mayores, se copian a las nuevas tablas ficha_*.
+                cur.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'adultos_mayores'
+                              AND column_name = 'sobrenombre'
+                        ) THEN
+                            INSERT INTO ficha_datos (
+                                adulto_mayor_id, nombre, sobrenombre, nivel_movilidad,
+                                estado_positividad, estado_animo_general, habitacion_principal,
+                                particularidad, detalles_movilidad
+                            )
+                            SELECT id, nombre, sobrenombre, nivel_movilidad,
+                                   estado_positividad, estado_animo_general, habitacion_principal,
+                                   particularidad, detalles_movilidad
+                            FROM adultos_mayores am
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM ficha_datos fd WHERE fd.adulto_mayor_id = am.id
+                            );
+
+                            INSERT INTO ficha_salud (
+                                adulto_mayor_id, tiene_enfermedad_preexistente,
+                                enfermedad_preexistente, requiere_medicacion,
+                                hora_levantarse, hora_acostarse
+                            )
+                            SELECT id, tiene_enfermedad_preexistente, enfermedad_preexistente,
+                                   requiere_medicacion, hora_levantarse, hora_acostarse
+                            FROM adultos_mayores am
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM ficha_salud fs WHERE fs.adulto_mayor_id = am.id
+                            );
+
+                            INSERT INTO ficha_preferencias (
+                                adulto_mayor_id, color_agrado, tema_gusto, actividades_diarias,
+                                actividades_semanales, detonantes_felicidad, detonantes_relajacion,
+                                detonantes_tristeza, detonantes_molestia
+                            )
+                            SELECT id, color_agrado, tema_gusto, actividades_diarias,
+                                   actividades_semanales, detonantes_felicidad, detonantes_relajacion,
+                                   detonantes_tristeza, detonantes_molestia
+                            FROM adultos_mayores am
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM ficha_preferencias fp WHERE fp.adulto_mayor_id = am.id
+                            );
+
+                            INSERT INTO ficha_notas (
+                                adulto_mayor_id, notas_cuidador, notas_adulto_mayor
+                            )
+                            SELECT id, notas_cuidador, notas_adulto_mayor
+                            FROM adultos_mayores am
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM ficha_notas fn WHERE fn.adulto_mayor_id = am.id
+                            );
+                        END IF;
+                    END
+                    $$;
+                    """
+                )
             conn.commit()
         database_available = True
         last_database_error = None
@@ -396,7 +555,10 @@ def init_database() -> None:
         last_database_error = str(exc)
         logger.exception("PostgreSQL history disabled")
 
-def get_recent_history_from_db() -> Optional[list[dict]]:
+def _session_id_for(adulto_mayor_id: int) -> str:
+    return f"adulto:{adulto_mayor_id}"
+
+def get_recent_history_from_db(adulto_mayor_id: int) -> Optional[list[dict]]:
     global database_available, last_database_error
 
     cutoff_seconds = settings.history_ttl_seconds
@@ -408,23 +570,23 @@ def get_recent_history_from_db() -> Optional[list[dict]]:
                         """
                         SELECT rol, contenido
                         FROM mensajes_conversacion
-                        WHERE sesion_id = %s
+                        WHERE adulto_mayor_id = %s
                           AND creado_en >= NOW() - (%s * INTERVAL '1 second')
                         ORDER BY creado_en DESC, id DESC
                         LIMIT %s
                         """,
-                        (settings.conversation_session_id, cutoff_seconds, settings.max_history_messages),
+                        (adulto_mayor_id, cutoff_seconds, settings.max_history_messages),
                     )
                 else:
                     cur.execute(
                         """
                         SELECT rol, contenido
                         FROM mensajes_conversacion
-                        WHERE sesion_id = %s
+                        WHERE adulto_mayor_id = %s
                         ORDER BY creado_en DESC, id DESC
                         LIMIT %s
                         """,
-                        (settings.conversation_session_id, settings.max_history_messages),
+                        (adulto_mayor_id, settings.max_history_messages),
                     )
                 rows = cur.fetchall()
         rows.reverse()
@@ -438,7 +600,7 @@ def get_recent_history_from_db() -> Optional[list[dict]]:
         logger.exception("PostgreSQL history read failed")
         return None
 
-def append_history_to_db(role: str, text: str) -> bool:
+def append_history_to_db(adulto_mayor_id: int, role: str, text: str) -> bool:
     global database_available, last_database_error
 
     try:
@@ -446,10 +608,10 @@ def append_history_to_db(role: str, text: str) -> bool:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO mensajes_conversacion (sesion_id, rol, contenido)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO mensajes_conversacion (adulto_mayor_id, sesion_id, rol, contenido)
+                    VALUES (%s, %s, %s, %s)
                     """,
-                    (settings.conversation_session_id, role, text),
+                    (adulto_mayor_id, _session_id_for(adulto_mayor_id), role, text),
                 )
             conn.commit()
         return True
@@ -459,20 +621,21 @@ def append_history_to_db(role: str, text: str) -> bool:
         logger.exception("PostgreSQL history write failed")
         return False
 
-def append_turn_history_to_db(user_text: str, model_text: str) -> bool:
+def append_turn_history_to_db(adulto_mayor_id: int, user_text: str, model_text: str) -> bool:
     global database_available, last_database_error
 
+    session_id = _session_id_for(adulto_mayor_id)
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.executemany(
                     """
-                    INSERT INTO mensajes_conversacion (sesion_id, rol, contenido)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO mensajes_conversacion (adulto_mayor_id, sesion_id, rol, contenido)
+                    VALUES (%s, %s, %s, %s)
                     """,
                     [
-                        (settings.conversation_session_id, "user", user_text),
-                        (settings.conversation_session_id, "model", model_text),
+                        (adulto_mayor_id, session_id, "user", user_text),
+                        (adulto_mayor_id, session_id, "model", model_text),
                     ],
                 )
             conn.commit()
@@ -482,6 +645,22 @@ def append_turn_history_to_db(user_text: str, model_text: str) -> bool:
         last_database_error = str(exc)
         logger.exception("PostgreSQL turn history write failed")
         return False
+
+def clear_history_for_profile(adulto_mayor_id: int) -> None:
+    if not database_available:
+        conversation_history.pop(adulto_mayor_id, None)
+        return
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM mensajes_conversacion WHERE adulto_mayor_id = %s",
+                    (adulto_mayor_id,),
+                )
+            conn.commit()
+    except Exception:
+        logger.exception("PostgreSQL history clear failed")
+    conversation_history.pop(adulto_mayor_id, None)
 
 def strip_repeated_greeting(text: str, history: Optional[list[dict]] = None) -> str:
     return text
@@ -532,6 +711,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event() -> None:
     global gemini_client
+    init_db_pool()
     init_database()
     gemini_client = httpx.AsyncClient(timeout=settings.gemini_timeout)
 
@@ -539,6 +719,7 @@ async def startup_event() -> None:
 async def shutdown_event() -> None:
     if gemini_client is not None:
         await gemini_client.aclose()
+    close_db_pool()
 
 async def post_to_gemini(url: str, payload: dict, headers: dict) -> httpx.Response:
     if gemini_client is None:
@@ -566,6 +747,7 @@ class Medication(BaseModel):
     colorOrShape: str = ""
 
 class SeniorProfile(BaseModel):
+    id: Optional[int] = None
     personName: str = ""
     nickname: str = ""
     mobilityLevel: str = ""
@@ -592,9 +774,14 @@ class SeniorProfile(BaseModel):
     seniorNotes: str = ""
     emergencyContacts: list[EmergencyContact] = Field(default_factory=list)
 
+class ProfileSummary(BaseModel):
+    id: int
+    personName: str = ""
+
 class Prompt(BaseModel):
     prompt: str
     profile: Optional[SeniorProfile] = None
+    profileId: Optional[int] = None
 
 class AuthRegister(BaseModel):
     name: str
@@ -610,6 +797,9 @@ class AuthGoogle(BaseModel):
 
 class ProfilePayload(BaseModel):
     profile: SeniorProfile
+
+class DeleteProfilePayload(BaseModel):
+    password: str
 
 def serialize_profile(profile: SeniorProfile) -> dict:
     if hasattr(profile, "model_dump"):
@@ -703,9 +893,8 @@ def create_session(user_id: int) -> str:
             cur.execute(
                 """
                 DELETE FROM sesiones_usuario
-                WHERE usuario_id = %s OR expira_en <= NOW()
-                """,
-                (user_id,),
+                WHERE expira_en <= NOW()
+                """
             )
             cur.execute(
                 """
@@ -791,185 +980,260 @@ def format_db_time(value: object) -> str:
         return value.strftime("%H:%M")
     return str(value)[:5]
 
-def save_profile_for_user(user_id: int, profile: SeniorProfile) -> None:
+def profile_belongs_to_user(cur, user_id: int, adulto_mayor_id: int) -> bool:
+    cur.execute(
+        "SELECT 1 FROM adultos_mayores WHERE id = %s AND usuario_id = %s",
+        (adulto_mayor_id, user_id),
+    )
+    return cur.fetchone() is not None
+
+def _write_profile_sections(cur, adulto_mayor_id: int, profile: SeniorProfile) -> None:
+    """Guarda cada apartado del formulario en su propia tabla (relacion 1:1)."""
+    cur.execute(
+        """
+        INSERT INTO ficha_datos (
+            adulto_mayor_id, nombre, sobrenombre, nivel_movilidad, estado_positividad,
+            estado_animo_general, habitacion_principal, particularidad, detalles_movilidad
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (adulto_mayor_id) DO UPDATE SET
+            nombre = EXCLUDED.nombre,
+            sobrenombre = EXCLUDED.sobrenombre,
+            nivel_movilidad = EXCLUDED.nivel_movilidad,
+            estado_positividad = EXCLUDED.estado_positividad,
+            estado_animo_general = EXCLUDED.estado_animo_general,
+            habitacion_principal = EXCLUDED.habitacion_principal,
+            particularidad = EXCLUDED.particularidad,
+            detalles_movilidad = EXCLUDED.detalles_movilidad
+        """,
+        (
+            adulto_mayor_id,
+            clean_text(profile.personName),
+            clean_text(profile.nickname),
+            clean_text(profile.mobilityLevel),
+            clean_text(profile.positivityState),
+            clean_text(profile.generalMood),
+            clean_text(profile.mainRoom),
+            clean_text(profile.particularity),
+            clean_text(profile.mobilityDetails),
+        ),
+    )
+    cur.execute(
+        """
+        INSERT INTO ficha_salud (
+            adulto_mayor_id, tiene_enfermedad_preexistente, enfermedad_preexistente,
+            requiere_medicacion, hora_levantarse, hora_acostarse
+        )
+        VALUES (%s, %s, %s, %s, %s::time, %s::time)
+        ON CONFLICT (adulto_mayor_id) DO UPDATE SET
+            tiene_enfermedad_preexistente = EXCLUDED.tiene_enfermedad_preexistente,
+            enfermedad_preexistente = EXCLUDED.enfermedad_preexistente,
+            requiere_medicacion = EXCLUDED.requiere_medicacion,
+            hora_levantarse = EXCLUDED.hora_levantarse,
+            hora_acostarse = EXCLUDED.hora_acostarse
+        """,
+        (
+            adulto_mayor_id,
+            profile.hasPreexistingDisease,
+            clean_text(profile.preexistingDisease),
+            profile.requiresMedication,
+            clean_time(profile.wakeTime),
+            clean_time(profile.sleepTime),
+        ),
+    )
+    cur.execute(
+        """
+        INSERT INTO ficha_preferencias (
+            adulto_mayor_id, color_agrado, tema_gusto, actividades_diarias, actividades_semanales,
+            detonantes_felicidad, detonantes_relajacion, detonantes_tristeza, detonantes_molestia
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (adulto_mayor_id) DO UPDATE SET
+            color_agrado = EXCLUDED.color_agrado,
+            tema_gusto = EXCLUDED.tema_gusto,
+            actividades_diarias = EXCLUDED.actividades_diarias,
+            actividades_semanales = EXCLUDED.actividades_semanales,
+            detonantes_felicidad = EXCLUDED.detonantes_felicidad,
+            detonantes_relajacion = EXCLUDED.detonantes_relajacion,
+            detonantes_tristeza = EXCLUDED.detonantes_tristeza,
+            detonantes_molestia = EXCLUDED.detonantes_molestia
+        """,
+        (
+            adulto_mayor_id,
+            clean_text(profile.favoriteColor),
+            clean_text(profile.favoriteTheme),
+            clean_text(profile.dailyActivities),
+            clean_text(profile.weeklyActivities),
+            clean_text(profile.happinessTriggers),
+            clean_text(profile.relaxationTriggers),
+            clean_text(profile.sadnessTriggers),
+            clean_text(profile.annoyanceTriggers),
+        ),
+    )
+    cur.execute(
+        """
+        INSERT INTO ficha_notas (adulto_mayor_id, notas_cuidador, notas_adulto_mayor)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (adulto_mayor_id) DO UPDATE SET
+            notas_cuidador = EXCLUDED.notas_cuidador,
+            notas_adulto_mayor = EXCLUDED.notas_adulto_mayor
+        """,
+        (
+            adulto_mayor_id,
+            clean_text(profile.caregiverNotes),
+            clean_text(profile.seniorNotes),
+        ),
+    )
+    cur.execute(
+        "DELETE FROM medicamentos_adulto_mayor WHERE adulto_mayor_id = %s",
+        (adulto_mayor_id,),
+    )
+    for index, medication in enumerate(profile.medications):
+        if not (medication.name or medication.schedule or medication.colorOrShape):
+            continue
+        cur.execute(
+            """
+            INSERT INTO medicamentos_adulto_mayor (
+                adulto_mayor_id, nombre, horario, color_forma, orden
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                adulto_mayor_id,
+                clean_text(medication.name),
+                clean_text(medication.schedule),
+                clean_text(medication.colorOrShape),
+                index,
+            ),
+        )
+    cur.execute(
+        "DELETE FROM contactos_emergencia WHERE adulto_mayor_id = %s",
+        (adulto_mayor_id,),
+    )
+    for index, contact in enumerate(profile.emergencyContacts):
+        if not (contact.name or contact.relationship or contact.phone):
+            continue
+        cur.execute(
+            """
+            INSERT INTO contactos_emergencia (
+                adulto_mayor_id, nombre, parentesco, telefono, orden
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                adulto_mayor_id,
+                clean_text(contact.name),
+                clean_text(contact.relationship),
+                clean_text(contact.phone),
+                index,
+            ),
+        )
+    # Sincroniza la etiqueta del perfil raiz (usada por el selector del frontend).
+    cur.execute(
+        "UPDATE adultos_mayores SET nombre = %s, actualizado_en = NOW() WHERE id = %s",
+        (clean_text(profile.personName), adulto_mayor_id),
+    )
+
+def list_profiles_for_user(user_id: int) -> list[ProfileSummary]:
+    if not database_available:
+        return []
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO adultos_mayores (
-                    usuario_id,
-                    nombre,
-                    sobrenombre,
-                    nivel_movilidad,
-                    estado_positividad,
-                    estado_animo_general,
-                    habitacion_principal,
-                    particularidad,
-                    detalles_movilidad,
-                    tiene_enfermedad_preexistente,
-                    enfermedad_preexistente,
-                    requiere_medicacion,
-                    hora_levantarse,
-                    hora_acostarse,
-                    color_agrado,
-                    tema_gusto,
-                    actividades_diarias,
-                    actividades_semanales,
-                    detonantes_felicidad,
-                    detonantes_relajacion,
-                    detonantes_tristeza,
-                    detonantes_molestia,
-                    notas_cuidador,
-                    notas_adulto_mayor
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s::time, %s::time, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                )
-                ON CONFLICT (usuario_id)
-                DO UPDATE SET
-                    nombre = EXCLUDED.nombre,
-                    sobrenombre = EXCLUDED.sobrenombre,
-                    nivel_movilidad = EXCLUDED.nivel_movilidad,
-                    estado_positividad = EXCLUDED.estado_positividad,
-                    estado_animo_general = EXCLUDED.estado_animo_general,
-                    habitacion_principal = EXCLUDED.habitacion_principal,
-                    particularidad = EXCLUDED.particularidad,
-                    detalles_movilidad = EXCLUDED.detalles_movilidad,
-                    tiene_enfermedad_preexistente = EXCLUDED.tiene_enfermedad_preexistente,
-                    enfermedad_preexistente = EXCLUDED.enfermedad_preexistente,
-                    requiere_medicacion = EXCLUDED.requiere_medicacion,
-                    hora_levantarse = EXCLUDED.hora_levantarse,
-                    hora_acostarse = EXCLUDED.hora_acostarse,
-                    color_agrado = EXCLUDED.color_agrado,
-                    tema_gusto = EXCLUDED.tema_gusto,
-                    actividades_diarias = EXCLUDED.actividades_diarias,
-                    actividades_semanales = EXCLUDED.actividades_semanales,
-                    detonantes_felicidad = EXCLUDED.detonantes_felicidad,
-                    detonantes_relajacion = EXCLUDED.detonantes_relajacion,
-                    detonantes_tristeza = EXCLUDED.detonantes_tristeza,
-                    detonantes_molestia = EXCLUDED.detonantes_molestia,
-                    notas_cuidador = EXCLUDED.notas_cuidador,
-                    notas_adulto_mayor = EXCLUDED.notas_adulto_mayor,
-                    actualizado_en = NOW()
-                RETURNING id
+                SELECT am.id, COALESCE(NULLIF(fd.nombre, ''), am.nombre, '')
+                FROM adultos_mayores am
+                LEFT JOIN ficha_datos fd ON fd.adulto_mayor_id = am.id
+                WHERE am.usuario_id = %s
+                ORDER BY am.creado_en, am.id
                 """,
-                (
-                    user_id,
-                    clean_text(profile.personName),
-                    clean_text(profile.nickname),
-                    clean_text(profile.mobilityLevel),
-                    clean_text(profile.positivityState),
-                    clean_text(profile.generalMood),
-                    clean_text(profile.mainRoom),
-                    clean_text(profile.particularity),
-                    clean_text(profile.mobilityDetails),
-                    profile.hasPreexistingDisease,
-                    clean_text(profile.preexistingDisease),
-                    profile.requiresMedication,
-                    clean_time(profile.wakeTime),
-                    clean_time(profile.sleepTime),
-                    clean_text(profile.favoriteColor),
-                    clean_text(profile.favoriteTheme),
-                    clean_text(profile.dailyActivities),
-                    clean_text(profile.weeklyActivities),
-                    clean_text(profile.happinessTriggers),
-                    clean_text(profile.relaxationTriggers),
-                    clean_text(profile.sadnessTriggers),
-                    clean_text(profile.annoyanceTriggers),
-                    clean_text(profile.caregiverNotes),
-                    clean_text(profile.seniorNotes),
-                ),
+                (user_id,),
+            )
+            return [ProfileSummary(id=row[0], personName=row[1]) for row in cur.fetchall()]
+
+# Maximo de adultos mayores que puede registrar un mismo apoderado.
+MAX_PROFILES_PER_USER = 2
+
+def create_profile_for_user(user_id: int, profile: SeniorProfile) -> SeniorProfile:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM adultos_mayores WHERE usuario_id = %s",
+                (user_id,),
+            )
+            if cur.fetchone()[0] >= MAX_PROFILES_PER_USER:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Solo puedes registrar {MAX_PROFILES_PER_USER} adultos mayores por cuenta",
+                )
+            cur.execute(
+                "INSERT INTO adultos_mayores (usuario_id, nombre) VALUES (%s, %s) RETURNING id",
+                (user_id, clean_text(profile.personName)),
             )
             adulto_mayor_id = cur.fetchone()[0]
-            cur.execute(
-                "DELETE FROM medicamentos_adulto_mayor WHERE adulto_mayor_id = %s",
-                (adulto_mayor_id,),
-            )
-            for index, medication in enumerate(profile.medications):
-                if not (medication.name or medication.schedule or medication.colorOrShape):
-                    continue
-                cur.execute(
-                    """
-                    INSERT INTO medicamentos_adulto_mayor (
-                        adulto_mayor_id, nombre, horario, color_forma, orden
-                    )
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (
-                        adulto_mayor_id,
-                        clean_text(medication.name),
-                        clean_text(medication.schedule),
-                        clean_text(medication.colorOrShape),
-                        index,
-                    ),
-                )
-            cur.execute(
-                "DELETE FROM contactos_emergencia WHERE adulto_mayor_id = %s",
-                (adulto_mayor_id,),
-            )
-            for index, contact in enumerate(profile.emergencyContacts):
-                if not (contact.name or contact.relationship or contact.phone):
-                    continue
-                cur.execute(
-                    """
-                    INSERT INTO contactos_emergencia (
-                        adulto_mayor_id, nombre, parentesco, telefono, orden
-                    )
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (
-                        adulto_mayor_id,
-                        clean_text(contact.name),
-                        clean_text(contact.relationship),
-                        clean_text(contact.phone),
-                        index,
-                    ),
-                )
+            _write_profile_sections(cur, adulto_mayor_id, profile)
+        conn.commit()
+    return load_profile(adulto_mayor_id)
+
+def update_profile_for_user(user_id: int, adulto_mayor_id: int, profile: SeniorProfile) -> SeniorProfile:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            if not profile_belongs_to_user(cur, user_id, adulto_mayor_id):
+                raise HTTPException(status_code=404, detail="Perfil no encontrado")
+            _write_profile_sections(cur, adulto_mayor_id, profile)
+        conn.commit()
+    return load_profile(adulto_mayor_id)
+
+def delete_profile_for_user(user_id: int, adulto_mayor_id: int) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            if not profile_belongs_to_user(cur, user_id, adulto_mayor_id):
+                raise HTTPException(status_code=404, detail="Perfil no encontrado")
+            # ON DELETE CASCADE borra ficha_*, medicamentos, contactos e historial.
+            cur.execute("DELETE FROM adultos_mayores WHERE id = %s", (adulto_mayor_id,))
         conn.commit()
 
-def load_profile_for_user(user_id: int) -> Optional[SeniorProfile]:
+def load_profile(adulto_mayor_id: int) -> Optional[SeniorProfile]:
     if not database_available:
         return None
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM adultos_mayores WHERE id = %s", (adulto_mayor_id,))
+            if not cur.fetchone():
+                return None
             cur.execute(
                 """
-                SELECT
-                    id,
-                    nombre,
-                    sobrenombre,
-                    nivel_movilidad,
-                    estado_positividad,
-                    estado_animo_general,
-                    habitacion_principal,
-                    particularidad,
-                    detalles_movilidad,
-                    tiene_enfermedad_preexistente,
-                    enfermedad_preexistente,
-                    requiere_medicacion,
-                    hora_levantarse,
-                    hora_acostarse,
-                    color_agrado,
-                    tema_gusto,
-                    actividades_diarias,
-                    actividades_semanales,
-                    detonantes_felicidad,
-                    detonantes_relajacion,
-                    detonantes_tristeza,
-                    detonantes_molestia,
-                    notas_cuidador,
-                    notas_adulto_mayor
-                FROM adultos_mayores
-                WHERE usuario_id = %s
+                SELECT nombre, sobrenombre, nivel_movilidad, estado_positividad,
+                       estado_animo_general, habitacion_principal, particularidad, detalles_movilidad
+                FROM ficha_datos WHERE adulto_mayor_id = %s
                 """,
-                (user_id,),
+                (adulto_mayor_id,),
             )
-            row = cur.fetchone()
-            if not row:
-                return None
-            adulto_mayor_id = row[0]
+            datos = cur.fetchone() or ("", "", "", "", "", "", "", "")
+            cur.execute(
+                """
+                SELECT tiene_enfermedad_preexistente, enfermedad_preexistente, requiere_medicacion,
+                       hora_levantarse, hora_acostarse
+                FROM ficha_salud WHERE adulto_mayor_id = %s
+                """,
+                (adulto_mayor_id,),
+            )
+            salud = cur.fetchone() or (False, "", False, None, None)
+            cur.execute(
+                """
+                SELECT color_agrado, tema_gusto, actividades_diarias, actividades_semanales,
+                       detonantes_felicidad, detonantes_relajacion, detonantes_tristeza, detonantes_molestia
+                FROM ficha_preferencias WHERE adulto_mayor_id = %s
+                """,
+                (adulto_mayor_id,),
+            )
+            preferencias = cur.fetchone() or ("", "", "", "", "", "", "", "")
+            cur.execute(
+                "SELECT notas_cuidador, notas_adulto_mayor FROM ficha_notas WHERE adulto_mayor_id = %s",
+                (adulto_mayor_id,),
+            )
+            notas = cur.fetchone() or ("", "")
             cur.execute(
                 """
                 SELECT nombre, horario, color_forma
@@ -998,29 +1262,30 @@ def load_profile_for_user(user_id: int) -> Optional[SeniorProfile]:
             ]
 
     return SeniorProfile(
-        personName=row[1],
-        nickname=row[2],
-        mobilityLevel=row[3],
-        positivityState=row[4],
-        generalMood=row[5],
-        mainRoom=row[6],
-        particularity=row[7],
-        mobilityDetails=row[8],
-        hasPreexistingDisease=row[9],
-        preexistingDisease=row[10],
-        requiresMedication=row[11],
-        wakeTime=format_db_time(row[12]),
-        sleepTime=format_db_time(row[13]),
-        favoriteColor=row[14],
-        favoriteTheme=row[15],
-        dailyActivities=row[16],
-        weeklyActivities=row[17],
-        happinessTriggers=row[18],
-        relaxationTriggers=row[19],
-        sadnessTriggers=row[20],
-        annoyanceTriggers=row[21],
-        caregiverNotes=row[22],
-        seniorNotes=row[23],
+        id=adulto_mayor_id,
+        personName=datos[0],
+        nickname=datos[1],
+        mobilityLevel=datos[2],
+        positivityState=datos[3],
+        generalMood=datos[4],
+        mainRoom=datos[5],
+        particularity=datos[6],
+        mobilityDetails=datos[7],
+        hasPreexistingDisease=salud[0],
+        preexistingDisease=salud[1],
+        requiresMedication=salud[2],
+        wakeTime=format_db_time(salud[3]),
+        sleepTime=format_db_time(salud[4]),
+        favoriteColor=preferencias[0],
+        favoriteTheme=preferencias[1],
+        dailyActivities=preferencias[2],
+        weeklyActivities=preferencias[3],
+        happinessTriggers=preferencias[4],
+        relaxationTriggers=preferencias[5],
+        sadnessTriggers=preferencias[6],
+        annoyanceTriggers=preferencias[7],
+        caregiverNotes=notas[0],
+        seniorNotes=notas[1],
         medications=medications,
         emergencyContacts=emergency_contacts,
     )
@@ -1155,17 +1420,67 @@ async def logout(authorization: Optional[str] = Header(None)):
     revoke_session(extract_bearer_token(authorization))
     return {"ok": True}
 
-@app.get("/api/profile")
-async def get_profile(authorization: Optional[str] = Header(None)):
+def assert_profile_owned(user_id: int, adulto_mayor_id: int) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            if not profile_belongs_to_user(cur, user_id, adulto_mayor_id):
+                raise HTTPException(status_code=404, detail="Perfil no encontrado")
+
+@app.get("/api/profiles")
+async def list_profiles(authorization: Optional[str] = Header(None)):
     user = require_user(authorization)
-    profile = load_profile_for_user(user["id"])
+    profiles = list_profiles_for_user(user["id"])
+    return {"profiles": [p.model_dump() for p in profiles]}
+
+@app.post("/api/profiles")
+async def create_profile(payload: ProfilePayload, authorization: Optional[str] = Header(None)):
+    user = require_user(authorization)
+    profile = create_profile_for_user(user["id"], payload.profile)
+    return {"ok": True, "profile": serialize_profile(profile)}
+
+@app.get("/api/profiles/{profile_id}")
+async def get_profile(profile_id: int, authorization: Optional[str] = Header(None)):
+    user = require_user(authorization)
+    assert_profile_owned(user["id"], profile_id)
+    profile = load_profile(profile_id)
     return {"profile": serialize_profile(profile) if profile else None}
 
-@app.post("/api/profile")
-async def save_profile(payload: ProfilePayload, authorization: Optional[str] = Header(None)):
+@app.put("/api/profiles/{profile_id}")
+async def update_profile(profile_id: int, payload: ProfilePayload, authorization: Optional[str] = Header(None)):
     user = require_user(authorization)
-    save_profile_for_user(user["id"], payload.profile)
-    return {"ok": True, "profile": serialize_profile(payload.profile)}
+    profile = update_profile_for_user(user["id"], profile_id, payload.profile)
+    return {"ok": True, "profile": serialize_profile(profile)}
+
+@app.delete("/api/profiles/{profile_id}")
+async def delete_profile(
+    profile_id: int,
+    payload: DeleteProfilePayload,
+    authorization: Optional[str] = Header(None),
+):
+    user = require_user(authorization)
+    stored_user = get_user_by_email(user["email"])
+    if not stored_user or not verify_password(payload.password, stored_user["password_hash"]):
+        raise HTTPException(status_code=403, detail="Contrasena incorrecta")
+    delete_profile_for_user(user["id"], profile_id)
+    return {"ok": True}
+
+@app.get("/api/profiles/{profile_id}/history")
+async def get_profile_history(profile_id: int, authorization: Optional[str] = Header(None)):
+    user = require_user(authorization)
+    assert_profile_owned(user["id"], profile_id)
+    history = get_recent_history(profile_id)
+    messages = [
+        {"role": item["role"], "text": item["parts"][0]["text"] if item.get("parts") else ""}
+        for item in history
+    ]
+    return {"messages": messages}
+
+@app.delete("/api/profiles/{profile_id}/history")
+async def delete_profile_history(profile_id: int, authorization: Optional[str] = Header(None)):
+    user = require_user(authorization)
+    assert_profile_owned(user["id"], profile_id)
+    clear_history_for_profile(profile_id)
+    return {"ok": True}
 
 @app.get("/api/test", response_class=PlainTextResponse)
 async def test():
@@ -1229,11 +1544,20 @@ async def gemini(p: Prompt, authorization: Optional[str] = Header(None)):
 
     profile = p.profile
     user = get_user_by_token(extract_bearer_token(authorization))
-    if profile is None and user:
-        profile = load_profile_for_user(user["id"])
+    adulto_mayor_id: Optional[int] = None
+    if user and p.profileId is not None:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if profile_belongs_to_user(cur, user["id"], p.profileId):
+                    adulto_mayor_id = p.profileId
+        if adulto_mayor_id is not None:
+            # El perfil guardado manda sobre lo enviado por el cliente.
+            db_profile = load_profile(adulto_mayor_id)
+            if db_profile is not None:
+                profile = db_profile
 
     personalized_user_text = build_personalized_user_text(user_text, profile)
-    recent_history = [] if is_simple_greeting(user_text) else get_recent_history()
+    recent_history = [] if is_simple_greeting(user_text) else get_recent_history(adulto_mayor_id)
     payload = build_gemini_payload(instr, personalized_user_text, recent_history)
 
     headers = {"Content-Type": "application/json", "X-goog-api-key": key}
@@ -1264,7 +1588,7 @@ async def gemini(p: Prompt, authorization: Optional[str] = Header(None)):
     if not text:
         return make_error_response("Gemini no devolvio texto util", 502)
 
-    append_turn_history(user_text, text)
+    append_turn_history(adulto_mayor_id, user_text, text)
     return PlainTextResponse(text)
 
 
